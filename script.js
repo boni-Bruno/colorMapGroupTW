@@ -1,8 +1,8 @@
 /*
  * Script Name: Group Color Map
- * Version: v2.0.0
- * Descrição: Pinta o território de cada grupo no mapa usando convex hull
- *            com overlay SVG semi-transparente.
+ * Version: v2.1.0
+ * Descrição: Pinta o território de cada grupo no mapa com Minkowski Buffer
+ *            (arcos SVG exatos nos vértices — garante cobertura de toda aldeia).
  */
 
 (function () {
@@ -15,9 +15,9 @@
     const CACHE_TTL      = 60 * 60 * 1000;
     const MAX_PAGES      = 100;
     const DELAY_MS       = 200;
-    const HULL_PAD       = 20;
+    const HULL_PAD       = 18;   // px de raio além das aldeias
     const FILL_OPACITY   = 0.28;
-    const STROKE_OPACITY = 0.7;
+    const STROKE_OPACITY = 0.75;
 
     const PALETTE = [
         { label: 'Padrão (sem cor)', value: ''        },
@@ -98,7 +98,7 @@
             }));
             const $html = $(html);
             const els   = $html.find('.quickedit-vn[data-id]');
-            if (els.length === 0) break;
+            if (!els.length) break;
             els.each(function () {
                 const vid    = String($(this).data('id'));
                 const gidStr = String(groupId);
@@ -131,8 +131,8 @@
     }
 
     /**
-     * Converte coordenada TW (cx, cy) → pixel relativo ao viewport do mapa.
-     * coordByPixel retorna um array [x, y].
+     * Converte coordenada TW (cx, cy) → pixel relativo ao viewport.
+     * TWMap.map.coordByPixel retorna um array [x, y].
      */
     function coordToPixel(cx, cy) {
         const origin = TWMap.map.coordByPixel(TWMap.map.pos[0], TWMap.map.pos[1]);
@@ -143,7 +143,6 @@
         };
     }
 
-    /** Agrupa posições em pixels por group_id */
     function buildGroupPixelPoints() {
         const groupPoints = {};
         for (const key in TWMap.villages) {
@@ -151,14 +150,12 @@
             const gids = villageGroupMap[String(v.id)] || [];
             if (!gids.length) continue;
 
-            // Primeiro grupo com cor definida vence
             let chosenGid = null;
             for (const gid of gids) {
                 if (groupColors[String(gid)]) { chosenGid = gid; break; }
             }
             if (!chosenGid) continue;
 
-            // Extrai coord a partir da chave numérica (cx*1000+cy)
             const num = parseInt(key);
             const tcy = num % 1000;
             const tcx = Math.floor(num / 1000);
@@ -193,9 +190,7 @@
             path.setAttribute('fill-opacity', String(FILL_OPACITY));
             path.setAttribute('stroke', color);
             path.setAttribute('stroke-opacity', String(STROKE_OPACITY));
-            path.setAttribute('stroke-width', '2');
-            path.setAttribute('stroke-linejoin', 'round');
-            path.setAttribute('stroke-linecap', 'round');
+            path.setAttribute('stroke-width', '1.5');
             svg.appendChild(path);
         }
     }
@@ -203,21 +198,93 @@
     // ── Geometria ─────────────────────────────────────────────────────────────
 
     function buildTerritoryPath(points) {
-        const tileR = TWMap.tileSize[0] / 2;
-        const pad   = HULL_PAD + tileR;
+        const radius = HULL_PAD + TWMap.tileSize[0] / 2;
 
         if (points.length === 1) {
-            const p = points[0], r = pad * 2;
-            return `M${p.x - r},${p.y} a${r},${r} 0 1,0 ${r * 2},0 a${r},${r} 0 1,0 ${-r * 2},0 Z`;
+            // Círculo exato ao redor da aldeia isolada
+            const p = points[0], r = radius;
+            return `M${p.x - r},${p.y} A${r},${r} 0 1,0 ${p.x + r},${p.y} A${r},${r} 0 1,0 ${p.x - r},${p.y} Z`;
         }
 
-        const hull    = points.length === 2 ? points : convexHull(points);
-        const expanded = expandHull(hull, pad);
-        const smooth   = chaikin(chaikin(expanded)); // 2 passes de suavização
-        return 'M ' + smooth.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L ') + ' Z';
+        const hull = points.length === 2 ? [points[0], points[1]] : convexHull(points);
+        return minkowskiBuffer(hull, radius);
     }
 
-    /** Andrew's monotone chain — O(n log n) */
+    /**
+     * Minkowski Buffer — expande o convex hull por `radius` pixels.
+     *
+     * Para cada aresta: desloca a aresta para fora por `radius`.
+     * Para cada vértice: insere um arco de círculo (raio = `radius`)
+     *   conectando as duas arestas adjacentes deslocadas.
+     *
+     * Garante que TODA aldeia no hull está dentro do território
+     * a exatamente `radius` px da borda — sem corner-cutting.
+     */
+    function minkowskiBuffer(hull, radius) {
+        const n = hull.length;
+        if (n === 0) return null;
+
+        // Centroide — usado para determinar a direção "para fora" de cada aresta
+        const cx = hull.reduce((s, p) => s + p.x, 0) / n;
+        const cy = hull.reduce((s, p) => s + p.y, 0) / n;
+
+        // Para cada aresta, calcula a versão deslocada para fora por `radius`
+        const edges = hull.map((a, i) => {
+            const b   = hull[(i + 1) % n];
+            const dx  = b.x - a.x;
+            const dy  = b.y - a.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+
+            // Normal candidata
+            const n1x = -dy / len, n1y = dx / len;
+
+            // Ponto médio da aresta — verifica se n1 aponta para fora do centroide
+            const midX = (a.x + b.x) / 2, midY = (a.y + b.y) / 2;
+            const dot  = (midX - cx) * n1x + (midY - cy) * n1y;
+            const nx   = dot >= 0 ? n1x : -n1x;
+            const ny   = dot >= 0 ? n1y : -n1y;
+
+            return {
+                a: { x: a.x + nx * radius, y: a.y + ny * radius },
+                b: { x: b.x + nx * radius, y: b.y + ny * radius },
+            };
+        });
+
+        /*
+         * Orientação do hull no sistema de coordenadas da tela (Y para baixo).
+         * Área com sinal positiva → CW → arcos externos no sentido CCW (sweep=0).
+         * Área com sinal negativa → CCW → arcos externos no sentido CW (sweep=1).
+         */
+        let area = 0;
+        for (let i = 0; i < n; i++) {
+            const j = (i + 1) % n;
+            area += hull[i].x * hull[j].y - hull[j].x * hull[i].y;
+        }
+        const sweep = area > 0 ? 0 : 1;
+
+        /*
+         * Constrói o path SVG:
+         *   → Linha ao longo de cada aresta deslocada
+         *   → Arco ao redor de cada vértice original
+         *
+         * Inicia no final da última aresta (pré-arco do 1º vértice).
+         */
+        let d = `M${edges[n - 1].b.x.toFixed(2)},${edges[n - 1].b.y.toFixed(2)} `;
+
+        for (let i = 0; i < n; i++) {
+            const curr = edges[i];
+            // Arco ao redor do vértice hull[i]: da ponta da aresta anterior
+            // até o início da aresta atual (sentido externo)
+            d += `A${radius},${radius} 0 0,${sweep} `;
+            d += `${curr.a.x.toFixed(2)},${curr.a.y.toFixed(2)} `;
+            // Linha ao longo da aresta atual
+            d += `L${curr.b.x.toFixed(2)},${curr.b.y.toFixed(2)} `;
+        }
+
+        return d + 'Z';
+    }
+
+    /** Andrew's monotone chain — convex hull O(n log n) */
     function convexHull(pts) {
         if (pts.length <= 2) return pts;
         const s     = [...pts].sort((a, b) => a.x !== b.x ? a.x - b.x : a.y - b.y);
@@ -234,29 +301,6 @@
         }
         upper.pop(); lower.pop();
         return lower.concat(upper);
-    }
-
-    /** Expande cada vértice do hull para fora do centroide */
-    function expandHull(hull, padding) {
-        const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
-        const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
-        return hull.map(p => {
-            const dx = p.x - cx, dy = p.y - cy;
-            const len = Math.sqrt(dx * dx + dy * dy) || 1;
-            return { x: p.x + (dx / len) * padding, y: p.y + (dy / len) * padding };
-        });
-    }
-
-    /** Chaikin corner-cutting — suaviza o polígono */
-    function chaikin(pts) {
-        if (pts.length < 3) return pts;
-        const out = [], n = pts.length;
-        for (let i = 0; i < n; i++) {
-            const a = pts[i], b = pts[(i + 1) % n];
-            out.push({ x: a.x * 0.75 + b.x * 0.25, y: a.y * 0.75 + b.y * 0.25 });
-            out.push({ x: a.x * 0.25 + b.x * 0.75, y: a.y * 0.25 + b.y * 0.75 });
-        }
-        return out;
     }
 
     // ── Hook de movimento ─────────────────────────────────────────────────────
@@ -283,9 +327,9 @@
     function buildUI() {
         const rows = groups.map(g => {
             const saved = groupColors[String(g.group_id)] || '';
-            const opts  = PALETTE.map(c => {
-                return `<option value="${c.value}" ${c.value === saved ? 'selected' : ''}>${c.label}</option>`;
-            }).join('');
+            const opts  = PALETTE.map(c =>
+                `<option value="${c.value}" ${c.value === saved ? 'selected' : ''}>${c.label}</option>`
+            ).join('');
             const dotCss = saved
                 ? `background:${saved};border:1px solid #555;`
                 : `background:transparent;border:1px dashed #bbb;`;
@@ -324,7 +368,9 @@
                 <div class="gcm-title">🗺️ ${SCRIPT_NAME}</div>
                 <table class="vis gcm-table">
                     <thead><tr><th>Grupo</th><th>Cor do Território</th></tr></thead>
-                    <tbody>${groups.length ? rows : '<tr><td colspan="2" style="text-align:center;padding:10px;color:#888;">Nenhum grupo encontrado.</td></tr>'}</tbody>
+                    <tbody>${groups.length ? rows
+                        : '<tr><td colspan="2" style="text-align:center;padding:10px;color:#888;">Nenhum grupo encontrado.</td></tr>'
+                    }</tbody>
                 </table>
                 <div class="gcm-actions">
                     <input type="button" class="btn btn-confirm-yes" id="gcm_btn_save"    value="💾 Salvar e Aplicar">
@@ -333,7 +379,7 @@
                 </div>
                 <div class="gcm-hint">
                     Cache: 1h &nbsp;|&nbsp; Opacidade: ${Math.round(FILL_OPACITY * 100)}%
-                    &nbsp;|&nbsp; Aldeia em múltiplos grupos: 1º com cor vence
+                    &nbsp;|&nbsp; Múltiplos grupos por aldeia: 1º com cor vence
                 </div>
             </div>`);
 
@@ -345,8 +391,8 @@
             }
         };
 
-        document.getElementById('gcm_btn_save').addEventListener('click', onSave);
-        document.getElementById('gcm_btn_reset').addEventListener('click', onReset);
+        document.getElementById('gcm_btn_save').addEventListener('click',    onSave);
+        document.getElementById('gcm_btn_reset').addEventListener('click',   onReset);
         document.getElementById('gcm_btn_refresh').addEventListener('click', onRefresh);
     }
 
